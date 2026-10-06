@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Heart Sound Monitor</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 { margin-bottom: 5px; }
+        p { color: #aaaaaa; margin-bottom: 20px; text-align: center; }
+
+        button {
+            background-color: #e91e63;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: 0.3s;
+            box-shadow: 0 4px 15px rgba(233, 30, 99, 0.4);
+        }
+
+        button:hover { background-color: #d81557; }
+
+        .dashboard {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 50px;
+            margin-top: 40px;
+            width: 100%;
+            max-width: 800px;
+        }
+
+        .heart-container {
+            width: 150px;
+            height: 150px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .heart {
+            background-color: #e91e63;
+            width: 50px;
+            height: 50px;
+            position: relative;
+            transform: rotate(-45deg) scale(1);
+            transition: transform 0.05s ease-out;
+            box-shadow: 0 0 20px rgba(233, 30, 99, 0.6);
+        }
+
+        .heart::before, .heart::after {
+            content: "";
+            background-color: #e91e63;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            position: absolute;
+        }
+
+        .heart::before { top: -25px; left: 0; }
+        .heart::after { top: 0; left: 25px; }
+
+        canvas {
+            background-color: #1e1e1e;
+            border: 2px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Heart Sound Visualizer</h1>
+    <p>Connect your ESP32 via USB. Requires Chrome or Edge.<br>Audio streams via USB at 115200 baud.</p>
+
+    <button id="connectBtn">Connect ESP32 (USB)</button>
+
+    <div class="dashboard">
+        <div class="heart-container">
+            <div class="heart" id="heartIcon"></div>
+        </div>
+        <canvas id="waveform" width="500" height="200"></canvas>
+    </div>
+
+    <script>
+        const connectBtn = document.getElementById('connectBtn');
+        const heartIcon = document.getElementById('heartIcon');
+        const canvas = document.getElementById('waveform');
+        const ctx = canvas.getContext('2d');
+
+        let audioCtx;
+        let nextAudioTime = 0;
+        let port;
+        let dataQueue = [];
+
+        ctx.fillStyle = "#1e1e1e";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "#00ffcc";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(0, canvas.height / 2);
+        ctx.lineTo(canvas.width, canvas.height / 2);
+        ctx.stroke();
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                connectBtn.innerText = "Connected! Listening...";
+                connectBtn.style.backgroundColor = "#4CAF50";
+
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                readSerialLoop();
+            } catch (err) {
+                console.error('Connection error:', err);
+                alert("Failed to connect. Make sure Arduino Serial Monitor is closed.");
+            }
+        });
+
+        async function readSerialLoop() {
+            const reader = port.readable.getReader();
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    for (let i = 0; i < value.length; i++) {
+                        dataQueue.push(value[i]);
+                    }
+                    processQueue();
+                }
+            } catch (error) {
+                console.error("Serial read error:", error);
+            } finally {
+                reader.releaseLock();
+            }
+        }
+
+        function processQueue() {
+            while (dataQueue.length >= 132) {
+                if (dataQueue[0] === 0xA5 && dataQueue[1] === 0x5A && dataQueue[2] === 128) {
+                    let payload = dataQueue.slice(3, 131);
+                    let receivedChecksum = dataQueue[131];
+
+                    let calculatedSum = 0;
+                    for (let i = 0; i < 128; i++) {
+                        calculatedSum = (calculatedSum + payload[i]) & 0xFF;
+                    }
+
+                    if (calculatedSum === receivedChecksum) {
+                        playAndVisualize(payload);
+                        dataQueue.splice(0, 132);
+                    } else {
+                        dataQueue.shift();
+                    }
+                } else {
+                    dataQueue.shift();
+                }
+            }
+        }
+
+        function playAndVisualize(payload) {
+            if (!audioCtx) return;
+
+            const buffer = audioCtx.createBuffer(1, payload.length, 4000);
+            const channelData = buffer.getChannelData(0);
+            let maxAmplitude = 0;
+
+            for (let i = 0; i < payload.length; i++) {
+                let floatSample = (payload[i] - 128) / 128.0;
+                channelData[i] = floatSample;
+                if (Math.abs(floatSample) > maxAmplitude) {
+                    maxAmplitude = Math.abs(floatSample);
+                }
+            }
+
+            const source = audioCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioCtx.destination);
+
+            if (nextAudioTime < audioCtx.currentTime) {
+                nextAudioTime = audioCtx.currentTime + 0.02;
+            } else if (nextAudioTime > audioCtx.currentTime + 0.3) {
+                nextAudioTime = audioCtx.currentTime + 0.05;
+            }
+
+            source.start(nextAudioTime);
+            nextAudioTime += buffer.duration;
+
+            drawWaveform(payload);
+
+            let currentScale = 1 + (maxAmplitude * 1.5);
+            heartIcon.style.transform = `rotate(-45deg) scale(${currentScale})`;
+        }
+
+        function drawWaveform(payload) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.beginPath();
+
+            let sliceWidth = canvas.width / payload.length;
+            let x = 0;
+
+            for(let i = 0; i < payload.length; i++) {
+                let v = payload[i] / 255.0;
+                let y = (1 - v) * canvas.height;
+
+                if(i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+                x += sliceWidth;
+            }
+            ctx.stroke();
+        }
+    </script>
+</body>
+</html>
